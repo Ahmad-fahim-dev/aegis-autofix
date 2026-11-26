@@ -1,0 +1,169 @@
+// AEGIS — Autonomous Engine for Guarding, Inspecting & Securing
+// Event-sourced run log + findings lifecycle store (PRD §3)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// One pipeline execution: Scan -> Triage -> Remediate -> Verify -> Report
+model Run {
+  id            String   @id @default(cuid())
+  repoUrl       String
+  repoName      String
+  repoSource    String   @default("") // GITHUB | SAMPLE
+  mode          String // REPORT_ONLY | AUTO_FIX
+  status        String // RESOLVING CLONING SCANNING TRIAGING REMEDIATING REPORTING COMPLETED FAILED
+  commitSha     String?
+  branch        String?
+  filesScanned  Int      @default(0)
+  locScanned    Int      @default(0)
+  costUsd       Float    @default(0)
+  llmModel      String?
+  engineMode    String? // GROQ | FALLBACK_HEURISTIC
+  budgetsJson   String?
+  reportMd      String?
+  reportHtml   String?
+  prPayloadJson String?
+  error         String?
+  failedStage   Int? // 5-stage graph index where a FAILED run died (0 scan … 4 dispatch); null on non-failures
+  startedAt     DateTime @default(now())
+  finishedAt    DateTime?
+  wallClockMs   Int?
+
+  findings    Finding[]
+  events     Event[]
+  attempts   RemediationAttempt[]
+  escalations Escalation[]
+  llmCalls   LlmCall[]
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+// Immutable lifecycle record: DETECTED -> TRIAGED -> (SUPPRESSED | PATCHING -> VERIFIED | ESCALATED | FAILED) / REPORTED
+model Finding {
+  id              String   @id @default(cuid())
+  runId           String
+  run             Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  fingerprint     String
+  dedupGroup      String?
+  tool            String
+  ruleId          String
+  category        String
+  title           String
+  description     String
+  filePath        String
+  line            Int
+  endLine         Int?
+  evidence        String
+  severityInitial String
+  severity        String
+  confidence      Float?
+  reasoning       String?
+  suppressed      Boolean  @default(false)
+  cve             String?
+  toolsJson       String? // corroborating tools after dedup (JSON array)
+  fixHint         String? // scanner's recommended fix (rendered in the report for unpatched findings)
+  fixable         Boolean  @default(true)
+  status          String   @default("DETECTED")
+
+  attempts    RemediationAttempt[]
+  escalation  Escalation?
+
+  createdAt DateTime @default(now())
+
+  @@index([runId])
+  @@index([runId, severity])
+  @@index([status])
+  @@index([suppressed])
+  @@index([tool])
+  @@index([category])
+}
+
+// One patch draft + sandbox verification (max 3 per finding per policy)
+model RemediationAttempt {
+  id              String   @id @default(cuid())
+  runId           String
+  run             Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  findingId       String
+  finding        Finding  @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  attemptNo       Int
+  strategy        String // SINGLE_FINDING | BATCH | TEMPLATE_FALLBACK
+  patchJson       String // structured edits + rationale
+  model           String
+  result          String // PASSED FAILED_APPLY FAILED_SYNTAX FAILED_RESCAN FAILED_POLICY ABORTED_BUDGET
+  failureContext  String?
+  verified        Boolean  @default(false)
+  costUsd         Float    @default(0)
+  durationMs      Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  @@index([runId])
+  @@index([findingId])
+}
+
+// Hand-off to human review queue with full attempt history
+model Escalation {
+  id         String    @id @default(cuid())
+  run        Run       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  runId      String
+  findingId  String    @unique
+  finding    Finding   @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  reason     String // MAX_ATTEMPTS BUDGET_EXHAUSTED POLICY_PROTECTED_PATH CRITICAL_SEVERITY
+  status     String    @default("OPEN") // OPEN APPROVED REJECTED
+  note       String?
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([runId])
+  @@index([status])
+  @@index([status, createdAt])
+}
+
+// Append-only event store: every scan, prompt, response, patch and test result (PRD §3)
+model Event {
+  id          String   @id @default(cuid())
+  runId       String
+  run         Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  seq         Int
+  type        String
+  stage       String?
+  level       String   @default("info") // info success warn error
+  message     String?
+  payloadJson String?
+  ts          DateTime @default(now())
+
+  @@index([runId, seq])
+}
+
+// Stage-level cost and duration telemetry for every LLM interaction
+model LlmCall {
+  id               String   @id @default(cuid())
+  runId            String
+  run              Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stage           String // TRIAGE REMEDIATE
+  provider         String // GROQ FALLBACK_HEURISTIC
+  model            String
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  latencyMs        Int      @default(0)
+  ok               Boolean  @default(true)
+  error            String?
+  degraded         Boolean  @default(false) // true when fallback served the call
+  createdAt        DateTime @default(now())
+
+  @@index([runId])
+  @@index([stage])
+}
+
+// Runtime configuration: Groq key override, model, budgets, protected paths
+model Setting {
+  key       String   @id
+  valueJson String
+  updatedAt DateTime @updatedAt
+}
