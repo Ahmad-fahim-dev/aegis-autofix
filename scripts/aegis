@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# aegis — operator CLI for a running AEGIS instance (Next.js API behind the Caddy gateway).
+# Env: AEGIS_BASE_URL (default http://127.0.0.1:81), AEGIS_TOKEN (optional bearer). Subcommands below.
+set -euo pipefail
+
+AEGIS_BASE_URL="${AEGIS_BASE_URL:-http://127.0.0.1:81}"
+AEGIS_TOKEN="${AEGIS_TOKEN:-}"
+
+die() { echo "aegis: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  aegis scan <repoUrl> [--mode auto-fix|report-only] [--wait]
+  aegis runs | stats | escalations
+  aegis status <runId>
+  aegis report <runId> [--format md|html|pr] [--out <file>]
+  aegis help
+env:
+  AEGIS_BASE_URL  gateway base URL (default http://127.0.0.1:81)
+  AEGIS_TOKEN     optional bearer token for the API
+EOF
+}
+
+# http METHOD URL [curl-args...] — curl with optional bearer auth.
+http() {
+  local method="$1" url="$2"; shift 2
+  local args=(-sS -X "$method")
+  if [[ -n "$AEGIS_TOKEN" ]]; then
+    args+=("-H" "Authorization: Bearer $AEGIS_TOKEN")
+  fi
+  curl "${args[@]}" "$url" "$@"
+}
+
+# die if a response body is an API error payload
+check_api_error() {
+  jq -e 'type == "object" and has("error")' <<<"$1" >/dev/null 2>&1 || return 0
+  die "$(jq -r '.error' <<<"$1")"
+}
+
+# post_run REPO_URL MODE — POST /api/runs; on 429 (engine at capacity, max 2
+# concurrent runs) waits 20s and retries once.
+post_run() {
+  local repo="$1" mode="$2" attempt tmp code=429
+  tmp=$(mktemp)
+  for attempt in 1 2; do
+    code=$(http POST "$AEGIS_BASE_URL/api/runs" -H "Content-Type: application/json" \
+      --data "$(jq -cn --arg r "$repo" --arg m "$mode" '{repoUrl: $r, mode: $m}')" \
+      -o "$tmp" -w '%{http_code}')
+    [[ "$code" == "429" && "$attempt" == "1" ]] || break
+    echo "aegis: engine at capacity (429) — waiting 20s, retrying once" >&2
+    sleep 20
+  done
+  [[ "$code" == 2* ]] || die "POST /api/runs failed (HTTP $code): $(cat "$tmp")"
+  cat "$tmp"; rm -f "$tmp"
+}
+
+cmd_scan() {
+  local repo="" mode_input="auto-fix" wait=0 mode body id status detail i
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode) mode_input="$2"; shift 2 ;;
+      --wait) wait=1; shift ;;
+      --*) die "scan: unknown option $1" ;;
+      *) [[ -z "$repo" ]] || die "scan: unexpected argument $1"; repo="$1"; shift ;;
+    esac
+  done
+  [[ -n "$repo" ]] || { usage >&2; die "scan: missing <repoUrl>"; }
+  case "${mode_input,,}" in
+    auto-fix | auto_fix | autofix) mode="AUTO_FIX" ;;
+    report-only | report_only | reportonly) mode="REPORT_ONLY" ;;
+    *) die "scan: unknown mode '$mode_input' (expected auto-fix or report-only)" ;;
+  esac
+  body=$(post_run "$repo" "$mode")
+  id=$(jq -r '.run.id' <<<"$body")
+  status=$(jq -r '.run.status' <<<"$body")
+  echo "run $id accepted (repo=$repo mode=$mode status=$status)"
+  if [[ "$wait" != "1" ]]; then
+    echo "hint: aegis status $id ; aegis report $id --format md"
+    return 0
+  fi
+  echo "waiting for terminal state (poll every 3s, up to 120 tries)..."
+  detail=""; status="UNKNOWN"
+  for i in $(seq 1 120); do
+    detail=$(http GET "$AEGIS_BASE_URL/api/runs/$id" || true)
+    status=$(jq -r '.run.status // "UNKNOWN"' <<<"$detail" 2>/dev/null || echo UNKNOWN)
+    case "$status" in COMPLETED | FAILED) break ;; esac
+    sleep 3
+  done
+  case "$status" in COMPLETED | FAILED) ;; *) die "scan: run $id did not reach a terminal state within 120 polls (last status: $status)" ;; esac
+  jq -r '"run=\(.run.id[0:10]) repo=\(.run.repoName) mode=\(.run.mode) status=\(.run.status) findings=\(.findings | length) verified=\([.findings[]? | select(.status == "VERIFIED" or .status == "HUMAN_APPROVED")] | length) escalated=\(.escalations | length) duration=\((((.run.wallClockMs // 0) / 1000) * 10 | floor) / 10)s"' <<<"$detail"
+  if [[ "$status" == "FAILED" ]]; then
+    jq -r '"run FAILED: \(.run.error // "no error recorded")"' <<<"$detail" >&2
+    exit 1
+  fi
+}
+
+cmd_runs() {
+  local body id repo mode status findings started
+  body=$(http GET "$AEGIS_BASE_URL/api/runs")
+  check_api_error "$body"
+  printf '%-10s  %-40s  %-12s  %-9s  %8s  %s\n' "ID" "REPO" "MODE" "STATUS" "FINDINGS" "STARTED"
+  while IFS=$'\t' read -r id repo mode status findings started; do
+    repo="${repo:0:40}"; printf '%-10s  %-40s  %-12s  %-9s  %8s  %s\n' "$id" "$repo" "$mode" "$status" "$findings" "$started"
+  done < <(jq -r '.runs[] | [(.id[0:10]), .repoName, .mode, .status, (.counts.findings | tostring), (.startedAt | tostring)] | @tsv' <<<"$body")
+}
+
+cmd_status() {
+  local body
+  body=$(http GET "$AEGIS_BASE_URL/api/runs/$1")
+  check_api_error "$body"
+  jq -r '(.findings | length) as $nf | (.escalations | length) as $ne | (.events | length) as $nv |
+    "run         \(.run.id)",
+    "repo        \(.run.repoName) (\(.run.repoUrl))",
+    "mode        \(.run.mode)",
+    "status      \(.run.status)",
+    "commit      \(.run.commitSha // "-")",
+    "scanned     \(.run.filesScanned) files / \(.run.locScanned) LOC",
+    "cost        $\(.run.costUsd)",
+    "duration    \((.run.wallClockMs // 0) / 1000)s",
+    "engine      \(.run.engineMode) \(.run.llmModel)",
+    "counts      findings=$nf escalations=$ne events=$nv",
+    "report      md=" + (if .run.hasReport then "yes" else "no" end) + " pr=" + (if .run.hasPr then "yes" else "no" end),
+    "error       \(.run.error // "-")"' <<<"$body"
+}
+
+cmd_report() {
+  local id="" format="md" out="" tmp code
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format) format="$2"; shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      --*) die "report: unknown option $1" ;;
+      *) [[ -z "$id" ]] || die "report: unexpected argument $1"; id="$1"; shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || die "usage: aegis report <runId> [--format md|html|pr] [--out <file>]"
+  case "$format" in md | html | pr) ;; *) die "report: format must be md, html or pr" ;; esac
+  tmp=$(mktemp)
+  code=$(http GET "$AEGIS_BASE_URL/api/runs/$id/report?format=$format" -o "$tmp" -w '%{http_code}')
+  [[ "$code" == 2* ]] || die "report request failed (HTTP $code): $(cat "$tmp")"
+  if [[ "$format" == "pr" ]]; then
+    if [[ -n "$out" ]]; then
+      { jq -r '.pr.title' "$tmp"; echo; jq -r '.pr.body' "$tmp"; } > "$out"
+      echo "wrote $out"
+    else
+      echo "PR TITLE:"
+      jq -r '.pr.title' "$tmp"
+      echo
+      echo "PR BODY:"
+      jq -r '.pr.body' "$tmp"
+    fi
+  elif [[ -n "$out" ]]; then
+    cat "$tmp" > "$out"
+    echo "wrote $out ($(wc -c < "$out") bytes)"
+  else
+    cat "$tmp"
+  fi
+  rm -f "$tmp"
+}
+
+cmd_escalations() {
+  local body reason status created
+  body=$(http GET "$AEGIS_BASE_URL/api/escalations")
+  check_api_error "$body"
+  echo "queueDepth=$(jq -r '.queueDepth' <<<"$body")  oldestOpen=$(jq -r '.oldestOpen // "none"' <<<"$body")"
+  printf '%-24s  %-9s  %s\n' "REASON" "STATUS" "CREATED"
+  while IFS=$'\t' read -r reason status created; do
+    printf '%-24s  %-9s  %s\n' "$reason" "$status" "$created"
+  done < <(jq -r '.escalations[] | select(.status == "OPEN") | [.reason, .status, (.createdAt | tostring)] | @tsv' <<<"$body")
+}
+
+cmd_stats() {
+  local body
+  body=$(http GET "$AEGIS_BASE_URL/api/stats")
+  check_api_error "$body"
+  jq -r '.kpis as $k | .queue as $q |
+    "autoFixRate         \((($k.autoFixRate * 10 | floor) / 10))%  (target \($k.autoFixTarget)%, stretch \($k.autoFixStretch)%)
+     suppressionRate    \((($k.suppressionRate * 10 | floor) / 10))%  (target \($k.suppressionTarget)%)
+     avgTimeToReport    \(((($k.avgTimeToReportMs / 1000) * 10 | floor) / 10))s  (target \($k.timeTargetMs / 1000)s)
+     costPerFinding     $\(($k.costPerFinding * 1000000 | floor) / 1000000)  (total $\($k.totalCostUsd))
+     queueDepth         \($q.depth)  (avg age \((($q.avgAgeHours * 100 | floor) / 100))h)"' <<<"$body"
+}
+
+main() {
+  local cmd="${1:-help}"
+  [[ $# -eq 0 ]] || shift
+  case "$cmd" in
+    help | -h | --help) usage ;;
+    scan) cmd_scan "$@" ;;
+    runs) cmd_runs "$@" ;;
+    status) [[ $# -ge 1 ]] || { usage >&2; die "status: missing <runId>"; }; cmd_status "$1" ;;
+    report) cmd_report "$@" ;;
+    escalations) cmd_escalations "$@" ;;
+    stats) cmd_stats "$@" ;;
+    *) echo "aegis: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
