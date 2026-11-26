@@ -1,0 +1,34 @@
+# AEGIS gateway.
+#
+# Security hardening (audit run-2): the XTransformPort route is both port- AND
+# path-scoped — only the socket.io endpoints of the realtime service are proxied.
+# Previously ANY path (including the engine's internal POST /broadcast bridge)
+# could be reached through the gateway with ?XTransformPort=3001; the bridge is
+# additionally protected by a shared secret, but the gateway should never expose
+# it in the first place. The live sandbox gateway is immutable, so the shared
+# secret is the enforced control there; this file is the hardened source of
+# truth for deployments where the gateway config can be applied.
+:81 {
+        @transform_socket_io {
+                path /socket.io*
+                query XTransformPort=3001
+        }
+
+        handle @transform_socket_io {
+                reverse_proxy localhost:{query.XTransformPort} {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
+
+        handle {
+                reverse_proxy localhost:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
+}
