@@ -110,8 +110,8 @@ model RemediationAttempt {
 // Hand-off to human review queue with full attempt history
 model Escalation {
   id         String    @id @default(cuid())
-  run        Run       @relation(fields: [runId], references: [id], onDelete: Cascade)
   runId      String
+  run        Run       @relation(fields: [runId], references: [id], onDelete: Cascade)
   findingId  String    @unique
   finding    Finding   @relation(fields: [findingId], references: [id], onDelete: Cascade)
   reason     String // MAX_ATTEMPTS BUDGET_EXHAUSTED POLICY_PROTECTED_PATH CRITICAL_SEVERITY
