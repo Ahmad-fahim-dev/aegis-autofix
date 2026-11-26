@@ -36,7 +36,7 @@ export function isProtectedPath(filePath: string, protectedPaths: string[]): boo
     if (pattern.includes("**/")) {
       const suffix = pattern.replace(/\*\*\//g, "")
       if (suffix.endsWith("/**")) {
-        const dir = suffix.replace(/\*\*$/, "")
+        const dir = suffix.replace(/\/\*\*$/, "")
         return filePath.includes(`/${dir}/`) || filePath.startsWith(`${dir}/`)
       }
       return filePath === suffix || filePath.endsWith(`/${suffix}`)
